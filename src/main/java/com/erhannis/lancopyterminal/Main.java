@@ -5,8 +5,11 @@
 package com.erhannis.lancopyterminal;
 
 import com.erhannis.lancopy.DataOwner;
+import com.erhannis.lancopy.data.BinaryData;
 import com.erhannis.lancopy.data.Data;
+import com.erhannis.lancopy.data.ErrorData;
 import com.erhannis.lancopy.data.FilesData;
+import com.erhannis.lancopy.data.NoData;
 import com.erhannis.lancopy.data.TextData;
 import com.erhannis.lancopy.refactor.Advertisement;
 import com.erhannis.lancopy.refactor.Comm;
@@ -26,7 +29,10 @@ import com.martiansoftware.jsap.SimpleJSAP;
 import com.martiansoftware.jsap.Switch;
 import com.martiansoftware.jsap.UnflaggedOption;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,14 +48,17 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.swing.DefaultListModel;
 import jcsp.helpers.JcspUtils;
+import jcsp.helpers.NameParallel;
 import jcsp.lang.Alternative;
 import jcsp.lang.AltingChannelInputInt;
 import jcsp.lang.Any2OneChannelInt;
+import jcsp.lang.CSProcess;
 import jcsp.lang.Channel;
 import jcsp.lang.ChannelOutputInt;
 import jcsp.lang.Guard;
 import jcsp.lang.ProcessManager;
 import jcsp.util.ints.OverWriteOldestBufferInt;
+import org.apache.commons.io.FileUtils;
 
 /**
  *
@@ -71,6 +80,8 @@ public class Main {
         }
     }
 
+    private static final Object inputLock = new Object();
+    
     private final DataOwner dataOwner;
     private final LanCopyNet.UiInterface uii;
 //    private ConcurrentLinkedDeque<CommsFrame> commsFrames = new ConcurrentLinkedDeque<>();
@@ -117,13 +128,15 @@ public class Main {
             msg = msg + "\n\n" + "Local fingerprint is\n" + localFingerprint;
             
             try {
-                if (TerminalUtils.promptYN(msg) == YNC.Y) {
-                    return true;
-                } else {
-                    return false;
+                synchronized (inputLock) {
+                    if (TerminalUtils.promptYN(msg) == YNC.Y) {
+                        return true;
+                    } else {
+                        return false;
+                    }
                 }
             } catch (IOException t) {
-                t.printStackTrace();
+                Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, t);
                 return false;
             }
         });
@@ -181,122 +194,269 @@ public class Main {
             setData(initialData);
         }
 
-        new ProcessManager(() -> {
-            Alternative alt = new Alternative(new Guard[]{uii.adIn, uii.commStatusIn, uii.summaryIn, uii.confirmationServer, showLocalFingerprintIn});
-            HashMap<UUID, Summary> summarys = new HashMap<>();
-            List<Advertisement> roster = uii.rosterCall.call(null);
-            for (Advertisement ad : roster) {
-                //TODO Creating a false Summary makes me uncomfortable
-                summarys.put(ad.id, new Summary(ad.id, ad.timestamp, "???"));
-            }
-            while (true) {
-                switch (alt.fairSelect()) {
-                    case 0: // adIn
-                    {
-                        Advertisement ad = uii.adIn.read();
-                        System.out.println("UI rx " + ad);
-                        if (!summarys.containsKey(ad.id)) {
-                            //TODO Creating a false Summary makes me uncomfortable
-                            summarys.put(ad.id, new Summary(ad.id, ad.timestamp, "???"));
+        ConcurrentHashMap<UUID, Summary> summarys = new ConcurrentHashMap<>();
+        
+        new ProcessManager(new NameParallel(new CSProcess[]{
+            () -> {
+                Thread.currentThread().setName("GUI");
+                while (true) {
+                    //RAINY It would be nice if we could properly interleave stdins and stdouts
+                    List<Advertisement> ads = uii.rosterCall.call(null);
+                    System.out.println("Nodes known:");
+                    for (int i = 0; i < ads.size(); i++) {
+                        Advertisement ad = ads.get(i);
+                        Summary summary = summarys.get(ad.id);
+                        System.out.println(i+" : "+summary+"\n"+ad+"\n");
+                    }
+                    String input;
+                    synchronized (inputLock) {
+                        System.out.println("I recommend periodically typing \"y<enter>\" a few times to clear any e.g. pending cert requests that can't ask because we're blocked on the GUI input request.");
+                        input = TerminalUtils.promptString("Which node do you want to pull from? ");
+                        System.out.println();
+                    }
+                    try {
+                        int i = Integer.parseInt(input);
+                        if (i < 0 || i >= ads.size()) {
+                            throw new RuntimeException();
                         }
-//                        Iterator<CommsFrame> cfi = commsFrames.iterator();
-//                        while (cfi.hasNext()) {
-//                            CommsFrame cf = cfi.next();
-//                            if (cf.isDisplayable()) {
-//                                cf.update(ad);
-//                            } else {
-//                                cfi.remove();
-//                            }
-//                        }
-                        uii.subscribeOut.write(ad.comms);
-  
-                        break;
-                    }
-                    case 1: // commStatusIn
-                    {
-                        Pair<Comm, Boolean> status = uii.commStatusIn.read();
-                        commStatus.put(status.a, status.b);
-                        System.out.println("UI rx " + status);
-//                        Iterator<CommsFrame> cfi = commsFrames.iterator();
-//                        while (cfi.hasNext()) {
-//                            CommsFrame cf = cfi.next();
-//                            if (cf.isDisplayable()) {
-//                                cf.update(status);
-//                            } else {
-//                                cfi.remove();
-//                            }
-//                        }
-                        break;
-                    }
-                    case 2: // summaryIn
-                    {
-                        Summary summary = uii.summaryIn.read();
-                        System.out.println("UI rx " + summary);
-                        summarys.put(summary.id, summary);
-                        break;
-                    }
-                    case 3: { // uii.confirmationServer
-                        String msg = uii.confirmationServer.startRead();
-                        boolean result = false;
-                        try {
-                            if (TerminalUtils.promptYN(msg) == YNC.Y) {
-                                result = true;
+                        pullFromNode(ads.get(i).id);
+                    } catch (Throwable t) {
+                        if ("h".equals(input)) {
+                            System.out.print("[number]: pull from node\n"
+                                    + "h: help\n"
+                                    + "r: repeat\n"
+                                    + "c: print comms\n"
+                                    + "po: print options\n"
+                                    + "so: set option\n"
+                                    + "q: quit\n");
+                        } else if ("r".equals(input)) {
+                            // Nothing I guess, just loop
+                        } else if ("c".equals(input)) {
+                            System.out.println("Comms:");
+                            for (ConcurrentHashMap.Entry<Comm, Boolean> e : commStatus.entrySet()) {
+                                System.out.println(e.getValue()+" : "+e.getKey().owner.id+" : "+e.getKey());
+                            }
+                        } else if ("po".equals(input)) {
+                            System.out.println("Options:");
+                            for (Map.Entry<String, Object> e : uii.dataOwner.options.getRecentEntries()) {
+                                System.out.println(e);
+                            }
+                        } else if ("so".equals(input)) {
+                            Options options = uii.dataOwner.options;
+                            String k = TerminalUtils.promptString("Option key: ");
+                            Object o = uii.dataOwner.options.peek(k);
+                            System.out.println("Current value: "+o);
+                            setValueBlock: if (o == null) {
+                                System.out.println("Currently not set, so we can't infer its type, and we don't currently support picking a type from the ui, sorry.");
                             } else {
+                                if (o instanceof Boolean) {
+                                    options.set(k, !(Boolean)o);
+                                    System.out.println("Boolean toggled");
+                                } else if (o instanceof String) {
+                                    String newValue = TerminalUtils.promptString("Option val (string) : ");
+                                    if (newValue != null) {
+                                        options.set(k, newValue);
+                                    }
+                                } else if (o instanceof Character) {
+                                    String newValue = TerminalUtils.promptString("Option val (character) : ");
+                                    if (newValue != null) {
+                                        if (newValue.length() != 1) {
+                                            System.out.println("Error, please enter a single character");
+                                            break setValueBlock;
+                                        }
+                                        options.set(k, newValue.charAt(0));
+                                    }
+                                } else if (o instanceof Integer) {
+                                    String newValue = TerminalUtils.promptString("Option val (int) : ");
+                                    if (newValue != null) {
+                                        int v = 0;
+                                        try {
+                                            v = Integer.parseInt(newValue);
+                                        } catch (NumberFormatException ex) {
+                                            System.out.println("Error, please enter an integer (max 32 bit)");
+                                            break setValueBlock;                                            
+                                        }
+                                        options.set(k, v);
+                                    }
+                                } else if (o instanceof Long) {
+                                    String newValue = TerminalUtils.promptString("Option val (long) : ");
+                                    if (newValue != null) {
+                                        long v = 0;
+                                        try {
+                                            v = Long.parseLong(newValue);
+                                        } catch (NumberFormatException ex) {
+                                            System.out.println("Error, please enter an integer (max 64 bit)");
+                                            break setValueBlock;                                            
+                                        }
+                                        options.set(k, v);
+                                    }
+                                } else if (o instanceof Float) {
+                                    String newValue = TerminalUtils.promptString("Option val (float) : ");
+                                    if (newValue != null) {
+                                        float v = 0;
+                                        try {
+                                            v = Float.parseFloat(newValue);
+                                        } catch (NumberFormatException ex) {
+                                            System.out.println("Error, please enter a floating point number");
+                                            break setValueBlock;                                            
+                                        }
+                                        options.set(k, v);
+                                    }
+                                } else if (o instanceof Double) {
+                                    String newValue = TerminalUtils.promptString("Option val (double) : ");
+                                    if (newValue != null) {
+                                        double v = 0;
+                                        try {
+                                            v = Double.parseDouble(newValue);
+                                        } catch (NumberFormatException ex) {
+                                            System.out.println("Error, please enter a double (floating point number)");
+                                            break setValueBlock;                                            
+                                        }
+                                        options.set(k, v);
+                                    }
+                                } else {
+                                    System.out.println("Sorry, unhandled datatype");
+                                    break setValueBlock;
+                                }
+                                if ((Boolean)options.getOrDefault("OptionsFrame.AUTOSAVE_OPTIONS", true)) {
+                                    try {
+                                        Options.saveOptions(options, OptionsFrame.DEFAULT_OPTIONS_FILENAME);
+                                    } catch (IOException ex) {
+                                        Logger.getLogger(OptionsFrame.class.getName()).log(Level.SEVERE, null, ex);
+                                        System.out.println("Failed to save options to disk.");
+                                    }
+                                }
+
+                            }
+                        } else if ("q".equals(input)) {
+                            System.out.println("Quitting");
+                            System.exit(0);
+                        } //RAINY I dunno, something else?  Settings, maybe?
+                        System.out.println();
+                    }
+                }
+            },
+            () -> {
+                Thread.currentThread().setName("LC/UI interface");
+                Alternative alt = new Alternative(new Guard[]{uii.adIn, uii.commStatusIn, uii.summaryIn, uii.confirmationServer, showLocalFingerprintIn});
+                List<Advertisement> roster = uii.rosterCall.call(null);
+                for (Advertisement ad : roster) {
+                    //TODO Creating a false Summary makes me uncomfortable
+                    summarys.put(ad.id, new Summary(ad.id, ad.timestamp, "???"));
+                }
+                while (true) {
+                    switch (alt.fairSelect()) {
+                        case 0: // adIn
+                        {
+                            Advertisement ad = uii.adIn.read();
+                            System.out.println("UI rx " + ad);
+                            if (!summarys.containsKey(ad.id)) {
+                                //TODO Creating a false Summary makes me uncomfortable
+                                summarys.put(ad.id, new Summary(ad.id, ad.timestamp, "???"));
+                            }
+    //                        Iterator<CommsFrame> cfi = commsFrames.iterator();
+    //                        while (cfi.hasNext()) {
+    //                            CommsFrame cf = cfi.next();
+    //                            if (cf.isDisplayable()) {
+    //                                cf.update(ad);
+    //                            } else {
+    //                                cfi.remove();
+    //                            }
+    //                        }
+                            uii.subscribeOut.write(ad.comms);
+
+                            break;
+                        }
+                        case 1: // commStatusIn
+                        {
+                            Pair<Comm, Boolean> status = uii.commStatusIn.read();
+                            commStatus.put(status.a, status.b);
+                            System.out.println("UI rx " + status);
+    //                        Iterator<CommsFrame> cfi = commsFrames.iterator();
+    //                        while (cfi.hasNext()) {
+    //                            CommsFrame cf = cfi.next();
+    //                            if (cf.isDisplayable()) {
+    //                                cf.update(status);
+    //                            } else {
+    //                                cfi.remove();
+    //                            }
+    //                        }
+                            break;
+                        }
+                        case 2: // summaryIn
+                        {
+                            Summary summary = uii.summaryIn.read();
+                            System.out.println("UI rx " + summary);
+                            summarys.put(summary.id, summary);
+                            break;
+                        }
+                        case 3: { // uii.confirmationServer
+                            String msg = uii.confirmationServer.startRead();
+                            boolean result = false;
+                            try {
+                                synchronized (inputLock) {
+                                    if (TerminalUtils.promptYN(msg) == YNC.Y) {
+                                        result = true;
+                                    } else {
+                                        result = false;
+                                    }
+                                }
+                            } catch (IOException t) {
+                                Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, t);
                                 result = false;
                             }
-                        } catch (IOException t) {
-                            t.printStackTrace();
-                            result = false;
+                            uii.confirmationServer.endRead(result);
+                            break;
                         }
-                        uii.confirmationServer.endRead(result);
-                        break;
-                    }
-                    case 4: { // showLocalFingerprintIn
-                        showLocalFingerprintIn.read();
-                        boolean show = (boolean) uii.dataOwner.options.getOrDefault("TLS.SHOW_LOCAL_FINGERPRINT", true);
-                        if (show) {
-                            try {
-                                TerminalUtils.promptChar("An incoming connection has paused, presumably for fingerprint verification.\nThe local TLS fingerprint is:\n" + uii.dataOwner.tlsContext.sha256Fingerprint);
-                            } catch (IOException ex) {
-                                Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, ex);
+                        case 4: { // showLocalFingerprintIn
+                            showLocalFingerprintIn.read();
+                            boolean show = (boolean) uii.dataOwner.options.getOrDefault("TLS.SHOW_LOCAL_FINGERPRINT", true);
+                            if (show) {
+                                synchronized (inputLock) {
+                                    try {
+                                        TerminalUtils.promptChar("An incoming connection has paused, presumably for fingerprint verification.\nThe local TLS fingerprint is:\n" + uii.dataOwner.tlsContext.sha256Fingerprint);
+                                    } catch (IOException ex) {
+                                        Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, ex);
+                                    }
+                                }
                             }
+                            break;
                         }
-                        break;
                     }
-                }
-                //TODO Make efficient
-                final HashMap<UUID, Summary> scopy = new HashMap<>(summarys);
+                    //TODO Make efficient
+                    final HashMap<UUID, Summary> scopy = new HashMap<>(summarys);
 
-                ArrayList<NodeLine> nodeLines = new ArrayList<>();
-                for (Map.Entry<UUID, Summary> entry : scopy.entrySet()) {
-                    nodeLines.add(new NodeLine(entry.getValue()));
-                }
-                int sorting = (int) uii.dataOwner.options.getOrDefault("NodeList.SORT_BY_(TIMESTAMP|ID|SUMMARY)", 0);
-                switch (sorting) {
-                    case 0: // Timestamp
-                        Collections.sort(nodeLines, (o1, o2) -> -Long.compare(o1.summary.timestamp, o2.summary.timestamp));
-                        break;
-                    case 1: // Id
-                        Collections.sort(nodeLines, (o1, o2) -> MeUtils.compare(o1.summary.id.toString(), o2.summary.id.toString()));
-                        break;
-                    case 2: // Summary
-                        Collections.sort(nodeLines, (o1, o2) -> MeUtils.compare(o1.summary.summary, o2.summary.summary));
-                        break;
-                }
+                    ArrayList<NodeLine> nodeLines = new ArrayList<>();
+                    for (Map.Entry<UUID, Summary> entry : scopy.entrySet()) {
+                        nodeLines.add(new NodeLine(entry.getValue()));
+                    }
+                    int sorting = (int) uii.dataOwner.options.getOrDefault("NodeList.SORT_BY_(TIMESTAMP|ID|SUMMARY)", 0);
+                    switch (sorting) {
+                        case 0: // Timestamp
+                            Collections.sort(nodeLines, (o1, o2) -> -Long.compare(o1.summary.timestamp, o2.summary.timestamp));
+                            break;
+                        case 1: // Id
+                            Collections.sort(nodeLines, (o1, o2) -> MeUtils.compare(o1.summary.id.toString(), o2.summary.id.toString()));
+                            break;
+                        case 2: // Summary
+                            Collections.sort(nodeLines, (o1, o2) -> MeUtils.compare(o1.summary.summary, o2.summary.summary));
+                            break;
+                    }
 
-                System.out.println("");
-                for (NodeLine nl : nodeLines) {
-                    System.out.println(nl);
+                    System.out.println("");
+                    for (NodeLine nl : nodeLines) {
+                        System.out.println(nl);
+                    }
+    //                SwingUtilities.invokeLater(() -> {
+    //                    modelServices.clear();
+    //                    for (NodeLine nl : nodeLines) {
+    //                        modelServices.addElement(nl);
+    //                    }
+    //                    // Invalidate model or something?
+    //                });
                 }
-//                SwingUtilities.invokeLater(() -> {
-//                    modelServices.clear();
-//                    for (NodeLine nl : nodeLines) {
-//                        modelServices.addElement(nl);
-//                    }
-//                    // Invalidate model or something?
-//                });
             }
-        }).run();
+        })).run();
 
 //        this.addWindowListener(new WindowListener() {
 //            @Override
@@ -438,6 +598,105 @@ public class Main {
 //        t.start();
     }
 
+    private void pullFromNode(UUID id) {
+        System.out.println("Pulling data...");
+        try {
+            //TODO This is not airtight; drag-n-drop still works, for instance
+            Pair<String, InputStream> result = uii.dataCall.call(id);
+            try { //[finally close stream]
+                Data data;
+                if (result == null) {
+                    data = new ErrorData("Node could not be reached");
+                } else {
+                    switch (result.a) {
+                        case "text/plain":
+                            data = TextData.deserialize(result.b);
+                            break;
+                        case "application/octet-stream":
+                            data = BinaryData.deserialize(result.b);
+                            break;
+                        case "lancopy/files":
+                            data = FilesData.deserialize(result.b, filename -> {
+                                String newFilename;
+                                synchronized (inputLock) {
+                                    newFilename = TerminalUtils.promptString("Filename? ["+filename+"]: ");
+                                }
+                                if (newFilename.isEmpty()) {
+                                    newFilename = filename;
+                                }
+                                return new File(newFilename);
+                            });
+                            break;
+                        case "lancopy/nodata":
+                            data = NoData.deserialize(result.b);
+                            break;
+                        default:
+                            data = new ErrorData("Unhandled MIME: " + result.a);
+                            break;
+                    }
+                }
+                //System.out.println("rx data: " + data);
+                if (data instanceof TextData) {
+                    String text = ((TextData) data).text;
+                    System.out.println("Pulled TextData: " + text);
+
+                    String newFilename;
+                    synchronized (inputLock) {
+                        newFilename = TerminalUtils.promptString("Save to what filename? [no]: ");
+                    }
+                    if (!newFilename.isEmpty()) {
+                        try {
+                            File f = new File(newFilename);
+                            FileWriter fw = new FileWriter(f);
+                            fw.append(text);
+                            fw.flush();
+                            fw.close();
+                        } catch (Throwable t) {
+                            Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, t);
+                        }
+                    }
+                } else if (data instanceof ErrorData) {
+                    System.out.println("Pulled ErrorData: " + ((ErrorData) data).text);
+                } else if (data instanceof BinaryData) {
+
+                    System.out.println("Pulled BinaryData");
+
+                    String newFilename;
+                    synchronized (inputLock) {
+                        newFilename = TerminalUtils.promptString("Save to what filename? [no]: ");
+                    }
+                    if (!newFilename.isEmpty()) {
+                        try {
+                            File f = new File(newFilename);
+                            FileUtils.copyInputStreamToFile(((BinaryData) data).stream, f);
+                            System.out.println("Saved BinaryData to file: "+f.getCanonicalPath());
+                        } catch (Throwable t) {
+                            Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, t);
+                        }
+                    } else {
+                        System.out.println("Discarded BinaryData.");
+                    }
+                } else if (data instanceof FilesData) {
+                    // Files are already saved
+                    FilesData fd = ((FilesData) data);
+                    System.out.println("Pulled and saved FilesData: "+fd.toLongString());
+                } else if (data instanceof NoData) {
+                    System.out.println("Pulled NoData: "+((NoData) data).toString());
+                } else {
+                    throw new RuntimeException("Unhandled data type");
+                }
+            } finally {
+                try {
+                    result.b.close();
+                } catch (Throwable t) {
+                    Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, t);
+                }
+            }
+        } catch (Throwable ex) {
+            Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, ex);
+        }
+    }
+    
     private void setData(Data data) {
         //taPostedData.setText("" + data);
         uii.newDataOut.write(data);
